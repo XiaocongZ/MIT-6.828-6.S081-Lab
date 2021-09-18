@@ -6,6 +6,9 @@
 #include "proc.h"
 #include "defs.h"
 
+extern pagetable_t kernel_pagetable;
+extern char etext[];  // kernel.ld sets this to end of kernel code.
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -26,21 +29,12 @@ void
 procinit(void)
 {
   struct proc *p;
-  
+
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
-
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
   }
+
   kvminithart();
 }
 
@@ -76,7 +70,7 @@ myproc(void) {
 int
 allocpid() {
   int pid;
-  
+
   acquire(&pid_lock);
   pid = nextpid;
   nextpid = nextpid + 1;
@@ -121,6 +115,21 @@ found:
     return 0;
   }
 
+  //per-proc kernel page table
+  p->kernel_pagetable = kvminit();
+
+  // Allocate a page for the process's kernel stack.
+  // Map it high in memory, followed by an invalid
+  // guard page.
+  char *pa = kalloc();
+  //printf("kalloc pa %p\n",pa);
+  if(pa == 0)
+    panic("allocproc");
+  uint64 va = KSTACK(0);
+  //printf("alloproc kstack: %p\n",va);
+  kvmmap2(p->kernel_pagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -139,9 +148,14 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if(p->kernel_pagetable)
+    proc_freekernelpagetable(p);
+  p->kernel_pagetable = 0;
   p->pagetable = 0;
+
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -195,6 +209,27 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmfree(pagetable, sz);
 }
 
+//Free per-process kernel table
+void
+proc_freekernelpagetable(struct proc *p)
+{
+
+  //etext is not aligned
+  uvmunmap(p->kernel_pagetable, TRAMPOLINE, 1, 0);
+  uvmunmap(p->kernel_pagetable, (uint64)etext, (PHYSTOP-PGROUNDDOWN((uint64)etext))/PGSIZE, 0);
+  uvmunmap(p->kernel_pagetable, KERNBASE, (PGROUNDDOWN((uint64)etext)-KERNBASE)/PGSIZE, 0);
+  uvmunmap(p->kernel_pagetable, PLIC, 0x400000/PGSIZE, 0);
+  uvmunmap(p->kernel_pagetable, CLINT, 0x10000/PGSIZE, 0);
+  uvmunmap(p->kernel_pagetable, VIRTIO0, 1, 0);
+  uvmunmap(p->kernel_pagetable, UART0, 1, 0);
+  //unmap per-process kernel stack
+  //free physical page
+  uvmunmap(p->kernel_pagetable, KSTACK(0), 1, 1);
+
+
+  uvmfree(p->kernel_pagetable, 0);
+}
+
 // a user program that calls exec("/init")
 // od -t xC initcode
 uchar initcode[] = {
@@ -215,7 +250,7 @@ userinit(void)
 
   p = allocproc();
   initproc = p;
-  
+  printf("userinit: cpu process:%p pid %d\n",p,p->pid);
   // allocate one user page and copy init's instructions
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
@@ -369,7 +404,7 @@ exit(int status)
   acquire(&p->lock);
   struct proc *original_parent = p->parent;
   release(&p->lock);
-  
+
   // we need the parent's lock in order to wake it up from wait().
   // the parent-then-child rule says we have to lock it first.
   acquire(&original_parent->lock);
@@ -440,7 +475,7 @@ wait(uint64 addr)
       release(&p->lock);
       return -1;
     }
-    
+
     // Wait for a child to exit.
     sleep(p, &p->lock);  //DOC: wait-sleep
   }
@@ -458,12 +493,12 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  
+
   c->proc = 0;
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
-    
+
     int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
@@ -473,12 +508,26 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        //change page table
+        w_satp(MAKE_SATP(p->kernel_pagetable));
+        sfence_vma();
+        /*
+        pte_t p1 = p->kernel_pagetable[PX(2, p->kstack)];
+        pagetable_t pgt2 = (pagetable_t) PTE2PA(p1);
+        pte_t p2 = pgt2[PX(1, p->kstack)];
+        pagetable_t pgt3 = (pagetable_t) PTE2PA(p2);
+        pte_t p3 = pgt3[PX(0, p->kstack)];
+        printf("before swtch kstack pte p3: %d\n",PTE_FLAGS(p3));
+        */
         swtch(&c->context, &p->context);
 
+        w_satp(MAKE_SATP(kernel_pagetable));
+        sfence_vma();
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
 
+        //vmprint(p->kernel_pagetable);
         found = 1;
       }
       release(&p->lock);
@@ -559,7 +608,7 @@ void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
-  
+
   // Must acquire p->lock in order to
   // change p->state and then call sched.
   // Once we hold p->lock, we can be

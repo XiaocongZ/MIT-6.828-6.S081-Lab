@@ -5,7 +5,7 @@
 #include "defs.h"
 
 volatile static int started = 0;
-
+extern pagetable_t kernel_pagetable;
 // start() jumps here in supervisor mode on all CPUs.
 void
 main()
@@ -20,7 +20,7 @@ main()
     printf("xv6 kernel is booting\n");
     printf("\n");
     kinit();         // physical page allocator
-    kvminit();       // create kernel page table
+    kernel_pagetable = kvminit();       // create kernel page table
     kvminithart();   // turn on paging
     procinit();      // process table
     trapinit();      // trap vectors
@@ -34,7 +34,7 @@ main()
 #ifdef LAB_NET
     pci_init();
     sockinit();
-#endif    
+#endif
     userinit();      // first user process
     __sync_synchronize();
     started = 1;
@@ -47,6 +47,6 @@ main()
     trapinithart();   // install kernel trap vector
     plicinithart();   // ask PLIC for device interrupts
   }
-
-  scheduler();        
+  printf("before entering scheduler\n");
+  scheduler();
 }
