@@ -18,6 +18,8 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+void u2ksync(pagetable_t kpt, pagetable_t upt, uint64 sz);
+
 /*
  * create a direct-map page table for the kernel.
  */
@@ -186,9 +188,9 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 void
 uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
+  if (DEBUG) printf("uvmunmap: va %p len %p\n",va,npages*PGSIZE);
   uint64 a;
   pte_t *pte;
-
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
 
@@ -241,12 +243,14 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
 uint64
 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 {
+  if (DEBUG) printf("uvmalloc: %p to %p\n",oldsz,newsz);
   char *mem;
   uint64 a;
 
   if(newsz < oldsz)
     return oldsz;
-
+  if(newsz>CLINT)
+    return 0;
   oldsz = PGROUNDUP(oldsz);
   for(a = oldsz; a < newsz; a += PGSIZE){
     mem = kalloc();
@@ -341,6 +345,10 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       goto err;
     }
   }
+
+  //struct proc *p = myproc();
+  //u2ksync(p->kernel_pagetable,new,sz);
+
   return 0;
 
  err:
@@ -348,6 +356,68 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   return -1;
 }
 
+void
+u2ksync_uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if((va % PGSIZE) != 0)
+    panic("uvmunmap: not aligned");
+
+  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+    if((pte = walk(pagetable, a, 0)) == 0)
+      continue;
+    if((*pte & PTE_V) == 0)
+      continue;
+    if(PTE_FLAGS(*pte) == PTE_V)
+      panic("uvmunmap: not a leaf");
+    if(do_free){
+      uint64 pa = PTE2PA(*pte);
+      kfree((void*)pa);
+    }
+    *pte = 0;
+  }
+}
+
+int
+u2ksync_mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  uint64 a, last;
+  pte_t *pte;
+
+  a = PGROUNDDOWN(va);
+  last = PGROUNDDOWN(va + size - 1);
+  for(;;){
+    if((pte = walk(pagetable, a, 1)) == 0)
+      return -1;
+    *pte = PA2PTE(pa) | perm | PTE_V;
+    //if (DEBUG) printf("u2ksync_mappages: va %p pa %p perm %d\n",a,pa,perm);
+    if(a == last)
+      break;
+    a += PGSIZE;
+    pa += PGSIZE;
+  }
+  return 0;
+}
+
+void
+u2ksync(pagetable_t kpt, pagetable_t upt, uint64 sz)
+{
+  if (DEBUG) printf("u2ksync: to sz %p\n",sz);
+  pte_t *upte;
+  uint64 i;
+  uint flags;
+  for(i = 0; i < sz; i += PGSIZE){
+    if((upte = walk(upt, i, 0)) == 0) panic("u2ksync: upte should exist");
+    //if((*upte & PTE_V) == 0) panic("u2ksync: user page not present");
+    flags = PTE_FLAGS(*upte) & (~PTE_U); //printf("u2ksync: upte %p *upte %p\n",upte,*upte);
+    u2ksync_mappages(kpt,i,PGSIZE,PTE2PA(*upte),flags);
+  }
+
+  u2ksync_uvmunmap(kpt,PGROUNDUP(sz),(CLINT-PGROUNDUP(sz))/PGSIZE,0);
+  return;
+}
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
@@ -392,23 +462,9 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  //if (DEBUG) printf("copyin: dst %p srcva %p len %d\n",dst, srcva, len);
+  //0x0000000000013f58
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -418,6 +474,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
+  /*
   uint64 n, va0, pa0;
   int got_null = 0;
 
@@ -452,6 +509,9 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+  */
+  if (DEBUG && 0x0000000000005da0==srcva) printf("copyinstr: dst %p srcva %p max %d\n",dst, srcva, max);
+  return copyinstr_new(pagetable, dst, srcva, max);
 }
 
 void

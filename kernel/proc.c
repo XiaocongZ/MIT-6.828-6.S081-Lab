@@ -225,8 +225,7 @@ proc_freekernelpagetable(struct proc *p)
   //unmap per-process kernel stack
   //free physical page
   uvmunmap(p->kernel_pagetable, KSTACK(0), 1, 1);
-
-
+  u2ksync_uvmunmap(p->kernel_pagetable,0,CLINT/PGSIZE,0);
   uvmfree(p->kernel_pagetable, 0);
 }
 
@@ -255,6 +254,8 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+
+  u2ksync(p->kernel_pagetable,p->pagetable,p->sz);
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -309,6 +310,8 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  u2ksync(np->kernel_pagetable,np->pagetable,np->sz);
 
   np->parent = p;
 
