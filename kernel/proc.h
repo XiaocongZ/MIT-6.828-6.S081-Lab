@@ -100,7 +100,12 @@ struct proc {
   pagetable_t pagetable;       // User page table
   struct trapframe *trapframe; // data page for trampoline.S
   struct context context;      // swtch() here to run process
+  struct trapframe sig_trapframe;
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  int sig_interval;
+  void *sig_handler;
+  uchar sig_inhandler;
+  int sig_tick;
 };

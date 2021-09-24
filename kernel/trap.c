@@ -46,10 +46,10 @@ usertrap(void)
   w_stvec((uint64)kernelvec);
 
   struct proc *p = myproc();
-  
+
   // save user program counter.
   p->trapframe->epc = r_sepc();
-  
+
   if(r_scause() == 8){
     // system call
 
@@ -78,8 +78,57 @@ usertrap(void)
 
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
-    yield();
+  {
 
+
+    if(p->sig_interval!=0 && p->sig_inhandler==0){
+      p->sig_tick++;
+      //printf("in timer interrupt sig_interval %d sig_tick++ %d\n",p->sig_interval,p->sig_tick);
+    }
+
+    if(p->sig_interval!=0 && p->sig_tick==p->sig_interval){
+      p->sig_inhandler = 1;
+      p->sig_tick = 0;
+      //save user stack
+      p->sig_trapframe.epc = p->trapframe->epc;
+
+      p->sig_trapframe.ra = p->trapframe->ra;
+      p->sig_trapframe.sp = p->trapframe->sp;
+      p->sig_trapframe.gp = p->trapframe->gp;
+      p->sig_trapframe.tp = p->trapframe->tp;
+      p->sig_trapframe.t0 = p->trapframe->t0;
+      p->sig_trapframe.t1 = p->trapframe->t1;
+      p->sig_trapframe.t2 = p->trapframe->t2;
+      p->sig_trapframe.s0 = p->trapframe->s0;
+      p->sig_trapframe.s1 = p->trapframe->s1;
+      p->sig_trapframe.a0 = p->trapframe->a0;
+      p->sig_trapframe.a1 = p->trapframe->a1;
+      p->sig_trapframe.a2 = p->trapframe->a2;
+      p->sig_trapframe.a3 = p->trapframe->a3;
+      p->sig_trapframe.a4 = p->trapframe->a4;
+      p->sig_trapframe.a5 = p->trapframe->a5;
+      p->sig_trapframe.a6 = p->trapframe->a6;
+      p->sig_trapframe.a7 = p->trapframe->a7;
+      p->sig_trapframe.s2 = p->trapframe->s2;
+      p->sig_trapframe.s3 = p->trapframe->s3;
+      p->sig_trapframe.s4 = p->trapframe->s4;
+      p->sig_trapframe.s5 = p->trapframe->s5;
+      p->sig_trapframe.s6 = p->trapframe->s6;
+      p->sig_trapframe.s7 = p->trapframe->s7;
+      p->sig_trapframe.s8 = p->trapframe->s8;
+      p->sig_trapframe.s9 = p->trapframe->s9;
+      p->sig_trapframe.s10 = p->trapframe->s10;
+      p->sig_trapframe.s11 = p->trapframe->s11;
+      p->sig_trapframe.t3 = p->trapframe->t3;
+      p->sig_trapframe.t4 = p->trapframe->t4;
+      p->sig_trapframe.t5 = p->trapframe->t5;
+      p->sig_trapframe.t6 = p->trapframe->t6;
+      //change user stack
+      //printf("sig_handler %p epc %p\n",(uint64)p->sig_handler,p->trapframe->epc);
+      p->trapframe->epc = (uint64)p->sig_handler;
+    }
+    yield();
+  }
   usertrapret();
 }
 
@@ -108,7 +157,7 @@ usertrapret(void)
 
   // set up the registers that trampoline.S's sret will use
   // to get to user space.
-  
+
   // set S Previous Privilege mode to User.
   unsigned long x = r_sstatus();
   x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
@@ -121,7 +170,7 @@ usertrapret(void)
   // tell trampoline.S the user page table to switch to.
   uint64 satp = MAKE_SATP(p->pagetable);
 
-  // jump to trampoline.S at the top of memory, which 
+  // jump to trampoline.S at the top of memory, which
   // switches to the user page table, restores user registers,
   // and switches to user mode with sret.
   uint64 fn = TRAMPOLINE + (userret - trampoline);
@@ -130,14 +179,14 @@ usertrapret(void)
 
 // interrupts and exceptions from kernel code go here via kernelvec,
 // on whatever the current kernel stack is.
-void 
+void
 kerneltrap()
 {
   int which_dev = 0;
   uint64 sepc = r_sepc();
   uint64 sstatus = r_sstatus();
   uint64 scause = r_scause();
-  
+
   if((sstatus & SSTATUS_SPP) == 0)
     panic("kerneltrap: not from supervisor mode");
   if(intr_get() != 0)
@@ -207,7 +256,7 @@ devintr()
     if(cpuid() == 0){
       clockintr();
     }
-    
+
     // acknowledge the software interrupt by clearing
     // the SSIP bit in sip.
     w_sip(r_sip() & ~2);
@@ -217,4 +266,3 @@ devintr()
     return 0;
   }
 }
-
