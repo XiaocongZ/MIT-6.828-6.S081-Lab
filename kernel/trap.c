@@ -46,10 +46,10 @@ usertrap(void)
   w_stvec((uint64)kernelvec);
 
   struct proc *p = myproc();
-  
+
   // save user program counter.
   p->trapframe->epc = r_sepc();
-  
+
   if(r_scause() == 8){
     // system call
 
@@ -68,9 +68,24 @@ usertrap(void)
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
-    printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
-    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-    p->killed = 1;
+    //printf("usertrap(): unexpected scause %p pid=%d\n sepc=%p stval=%p\n", r_scause(), p->pid, r_sepc(), r_stval());
+    //interrupt not handled, handle here
+    if(r_scause()==13 || r_scause()==15){
+
+      uint64 va = r_stval();
+      //printf("r 13/15 va %p sp %p\n", va, p->trapframe->sp);
+      if(va>=p->sz){
+        p->killed = 1;
+      }
+      else if(lazy_uvmalloc(p->pagetable, PGROUNDDOWN(va)) != 0 ){
+        //printf("lazy_uvmalloc not 0\n");
+        p->killed = 1;
+      }
+    }
+    else{
+      p->killed = 1;
+
+    }
   }
 
   if(p->killed)
@@ -108,7 +123,7 @@ usertrapret(void)
 
   // set up the registers that trampoline.S's sret will use
   // to get to user space.
-  
+
   // set S Previous Privilege mode to User.
   unsigned long x = r_sstatus();
   x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
@@ -121,7 +136,7 @@ usertrapret(void)
   // tell trampoline.S the user page table to switch to.
   uint64 satp = MAKE_SATP(p->pagetable);
 
-  // jump to trampoline.S at the top of memory, which 
+  // jump to trampoline.S at the top of memory, which
   // switches to the user page table, restores user registers,
   // and switches to user mode with sret.
   uint64 fn = TRAMPOLINE + (userret - trampoline);
@@ -130,23 +145,40 @@ usertrapret(void)
 
 // interrupts and exceptions from kernel code go here via kernelvec,
 // on whatever the current kernel stack is.
-void 
+void
 kerneltrap()
 {
   int which_dev = 0;
   uint64 sepc = r_sepc();
   uint64 sstatus = r_sstatus();
   uint64 scause = r_scause();
-  
+
   if((sstatus & SSTATUS_SPP) == 0)
     panic("kerneltrap: not from supervisor mode");
   if(intr_get() != 0)
     panic("kerneltrap: interrupts enabled");
 
   if((which_dev = devintr()) == 0){
-    printf("scause %p\n", scause);
-    printf("sepc=%p stval=%p\n", r_sepc(), r_stval());
-    panic("kerneltrap");
+    /*
+    struct proc *p = myproc();
+    if(r_scause()==13 || r_scause()==15){
+      //printf("triggered lazy_uvmalloc\n");
+      uint64 va = PGROUNDDOWN(r_stval());
+      //printf("va %p\n",va);
+      if(va>=p->sz){
+        p->killed = 1;
+      }
+      else if(lazy_uvmalloc(p->pagetable, va) != 0 ){
+        //printf("lazy_uvmalloc fail\n");
+        p->killed = 1;
+      }
+    }
+    */
+    //else{
+      printf("scause %p\n", scause);
+      printf("sepc=%p stval=%p\n", r_sepc(), r_stval());
+      panic("kerneltrap");
+    //}
   }
 
   // give up the CPU if this is a timer interrupt.
@@ -207,7 +239,7 @@ devintr()
     if(cpuid() == 0){
       clockintr();
     }
-    
+
     // acknowledge the software interrupt by clearing
     // the SSIP bit in sip.
     w_sip(r_sip() & ~2);
@@ -217,4 +249,3 @@ devintr()
     return 0;
   }
 }
-

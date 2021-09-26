@@ -5,7 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
-
+#include "spinlock.h"
+#include "proc.h"
 /*
  * the kernel's page table.
  */
@@ -131,7 +132,7 @@ kvmpa(uint64 va)
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
-  
+
   pte = walk(kernel_pagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
@@ -181,9 +182,12 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+      continue;//panic("uvmunmap: walk");
+    if((*pte & PTE_V) == 0){
+      //panic("uvmunmap: not mapped");
+      *pte = 0;
+      continue;
+    }
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -251,6 +255,56 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   return newsz;
 }
 
+//ret 0 malloc success or already done
+//ret 1 valid already, just not PTE_U
+//ret -1 out of mem, out of sz
+uint64
+lazy_uvmalloc(pagetable_t pagetable, uint64 va)
+{
+  struct proc *p = myproc();
+  if (p->sz<=va) return -1;
+
+  char *mem;
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte != 0 && *pte & PTE_V){
+    //printf("lazy_uvmalloc\n pte %p sp %p sz %p PTE_U %p\n",*pte, p->trapframe->sp, p->sz, *pte&PTE_U);
+
+    if((*pte&PTE_U) == 0) return 1;
+    return 0;
+  }
+  mem = kalloc();
+  if(mem == 0){
+    return -1;
+  }
+  memset(mem, 0, PGSIZE);
+  if(mappages(pagetable, va, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+    kfree(mem);
+    uvmunmap(pagetable, va, 1, 0);
+    return -1;
+  }
+  return 0;
+}
+
+//not in use
+uint64
+lazy_stack(pagetable_t pagetable, uint64 va)
+{
+  struct proc *p = myproc();
+  if(p->trapframe->sp-va>=PGSIZE) panic("lazy_stack: va out of range");
+  pte_t *pte = walk(pagetable, va, 0);
+  pte_t *pte_bottom = walk(pagetable, va-PGSIZE, 0);
+  if(pte == 0){
+    panic("lazy_stack: pte is zero");
+  }
+  else if ((*pte & PTE_V) == 0) panic("lazy_stack: pte not PTE_V");
+  else if(*pte & PTE_U) panic("lazy_stack: pte already PTE_U");
+  else{
+    *pte |= PTE_U;
+    *pte_bottom |= ~PTE_U;
+  }
+  return 0;
+}
+
 // Deallocate user pages to bring the process size from oldsz to
 // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
 // need to be less than oldsz.  oldsz can be larger than the actual
@@ -315,9 +369,11 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+      continue;
+      //panic("uvmcopy: pte should exist"); pass for lazy_uvmalloc
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      continue;
+      //panic("uvmcopy: page not present"); pass for lazy_uvmalloc
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -341,7 +397,7 @@ void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
-  
+
   pte = walk(pagetable, va, 0);
   if(pte == 0)
     panic("uvmclear");

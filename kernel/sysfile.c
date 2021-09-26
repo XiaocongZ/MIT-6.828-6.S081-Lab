@@ -87,6 +87,19 @@ sys_write(void)
 
   if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argaddr(1, &p) < 0)
     return -1;
+  uint64 va=p;
+  for(int i=n;i>0;){
+    //printf("sys_write i %d pid %d\n",i,myproc()->pid);
+    uint64 ret = lazy_uvmalloc(myproc()->pagetable, va);
+    //printf("sys_write: lazy_uvmalloc %d\n",ret);
+    if (ret != 0){
+      //printf("sys_write: lazy_uvmalloc -1\n");
+      return -1;
+    }
+
+    i = i-PGSIZE;
+    va = va+PGSIZE;
+  }
 
   return filewrite(f, p, n);
 }
@@ -359,6 +372,7 @@ sys_mkdir(void)
 
   begin_op();
   if(argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0){
+    //printf("mkdir ip %p",ip);
     end_op();
     return -1;
   }
@@ -393,7 +407,7 @@ sys_chdir(void)
   char path[MAXPATH];
   struct inode *ip;
   struct proc *p = myproc();
-  
+
   begin_op();
   if(argstr(0, path, MAXPATH) < 0 || (ip = namei(path)) == 0){
     end_op();
@@ -464,6 +478,9 @@ sys_pipe(void)
 
   if(argaddr(0, &fdarray) < 0)
     return -1;
+  //lazy_uvmalloc
+  lazy_uvmalloc(myproc()->pagetable, fdarray);
+
   if(pipealloc(&rf, &wf) < 0)
     return -1;
   fd0 = -1;
