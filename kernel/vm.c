@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -14,6 +16,9 @@ pagetable_t kernel_pagetable;
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
+
+extern uchar cow_ref[];
+extern struct spinlock cow_lock;
 
 /*
  * create a direct-map page table for the kernel.
@@ -131,7 +136,7 @@ kvmpa(uint64 va)
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
-  
+
   pte = walk(kernel_pagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
@@ -277,12 +282,15 @@ freewalk(pagetable_t pagetable)
   // there are 2^9 = 512 PTEs in a page table.
   for(int i = 0; i < 512; i++){
     pte_t pte = pagetable[i];
+
     if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
       // this PTE points to a lower-level page table.
       uint64 child = PTE2PA(pte);
       freewalk((pagetable_t)child);
       pagetable[i] = 0;
     } else if(pte & PTE_V){
+      if(DEBUG) printf("freewalk: %d\n", i);
+      if(DEBUG) printf("freewalk: pte %p\n", pte);
       panic("freewalk: leaf");
     }
   }
@@ -306,7 +314,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+uvmcopy_original(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
@@ -334,6 +342,192 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
+//PTE_U to PTE_U
+int
+uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+  if(DEBUG) printf("head of uvmcopy: sz %p\n",sz );
+  if(DEBUG) uvmshow(old, sz);
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walk(old, i, 0)) == 0)
+      panic("uvmcopy: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("uvmcopy: page not present");
+    if((*pte & PTE_U) == 0){
+      if(DEBUG) printf("uvmcopy: not PTE_U va %p\n", i);
+      //panic("uvmcopy: not PTE_U");
+    }
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    if(flags&PTE_U){
+      //old is cow or not?
+      if (flags&(PTE_R|PTE_COW_R)){
+        flags |= PTE_COW_R;
+        *pte |= PTE_COW_R;
+      }
+      if (flags&(PTE_W|PTE_COW_W)){
+        flags &= ~PTE_W; //mark as not writable!
+        flags |= PTE_COW_W;
+        *pte |= PTE_COW_W;
+        *pte &= ~PTE_W;
+      }
+    }
+    else{
+      ;//flags stay the same, ~PTE_U
+    }
+    if(DEBUG) printf("uvmcopy: acquire cowlock\n");
+    acquire(&cow_lock);
+    //if count is 0, add 2; else add 1
+    if (cow_ref[COWREFINDEX(pa)] == 0) cow_ref[COWREFINDEX(pa)]++;
+    cow_ref[COWREFINDEX(pa)]++;
+    release(&cow_lock);
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      goto err;
+    }
+  }
+  if(DEBUG) printf("return of uvmcopy\n");
+  if(DEBUG) uvmshow(new, sz);
+  return 0;
+
+ err:
+  panic("uvmcopy_cow: mappages fail");
+}
+
+//uncow a virtual page, optionally alloc new phy page
+int
+uvmuncow(pagetable_t pagetable, uint64 va)
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  if(DEBUG) printf("head of uvmuncow:va %p\n", va);
+  if(DEBUG) uvmshow(pagetable, p->sz);
+
+  if(va >= p->sz){
+    if(DEBUG) printf("uvmuncow: va >= p->sz\n");
+    return -1;
+  }
+  pte = walk(pagetable, va, 0);
+  if(pte == 0){
+    if(DEBUG) printf("uvmuncow: va not mapped in pagetable\n");
+    return -1;
+  }
+
+  pa = PTE2PA(*pte);
+
+  if(DEBUG) printf("uvmuncow: acquire cowlock\n");
+  acquire(&cow_lock);
+  if(cow_ref[COWREFINDEX(pa)]==0){
+    panic("uvmuncow: pa not a cow page\n");
+    //return -1;
+  }
+  release(&cow_lock);
+  //stack guard page is pte not PTE_COW_R/W
+  /*
+  if( (*pte & (PTE_COW_R|PTE_COW_W)) == 0){
+    printf("pid %d pte %p\nref count %d\n",p->pid, *pte, cow_ref[COWREFINDEX(pa)]);
+    panic("uvmuncow: pte not PTE_COW_R/W");
+  }
+  */
+
+  if(*pte & PTE_U){
+    flags = PTE_V | PTE_X | PTE_U;
+  }else{
+    //if(va<p->sz) return -1;//userspace not PTE_U, kill
+    if(DEBUG) printf("uvmuncow on Kernel page or guard page\n");
+    if(!(*pte & (PTE_COW_R|PTE_COW_W))){
+      if(DEBUG) printf("uvmuncow on not PTE_U and not PTE_COW_R|PTE_COW_W\n");
+      return -1;
+    }
+    flags = PTE_V | PTE_X | PTE_U;
+    //panic("uvmuncow:don't support k to u uncow");
+  }
+
+  if(*pte & PTE_COW_R) flags |= PTE_R;
+  if(*pte & PTE_COW_W) flags |= PTE_W;
+
+  if(DEBUG) printf("uvmuncow: acquire cowlock\n");
+  acquire(&cow_lock);
+  if (cow_ref[COWREFINDEX(pa)]>=2){
+    if(DEBUG) printf("uvmuncow: alloc flags %p\n",flags);
+    char *mem = kalloc();
+    //uvmunmap; alloc new page
+    if(mem == 0) {
+      release(&cow_lock);
+      return -1;
+    }
+    cow_ref[COWREFINDEX(pa)]--;
+
+    uvmunmap(pagetable, PGROUNDDOWN(va), 1, 0);
+    //memcopy !!!!!!
+    memmove(mem, (char*)pa, PGSIZE);
+    if(mappages(pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, flags) != 0){
+      release(&cow_lock);
+      return -1;//need PGROUNDDOWN for alignment, or will map one more
+    }
+  }
+  else if(cow_ref[COWREFINDEX(pa)]==1){
+    if(DEBUG) printf("uvmuncow: cow to not cow\n");
+
+    //make not cow
+    cow_ref[COWREFINDEX(pa)] = 0;
+
+    *pte |= flags;
+    *pte &= ~(PTE_COW_R|PTE_COW_W);
+  }
+  else{
+    panic("uvmuncow: cow ref count 0");
+  }
+  release(&cow_lock);
+  if(DEBUG) printf("return of uvmuncow\n");
+  if(DEBUG) uvmshow(pagetable, p->sz);
+  return 0;
+}
+
+void uvmshow(pagetable_t pagetable, uint64 sz)
+{
+  uint64 i;
+  pte_t *pte;
+  uint64 pa;
+  struct proc *p = myproc();
+  printf("uvmshow pid %d sz %p\n", p->pid, p->sz);
+  for (i=0;i<sz;i+=0x1000) {
+    pte = walk(pagetable, i, 0);
+    if(pte == 0){
+      printf("  %p 0\n",i);
+      continue;
+    }
+    pa = PTE2PA(*pte);
+    printf("  %p %p ",i,pa);
+    if (*pte & PTE_COW_W) printf("COW_W ");
+    else printf("XXXXX ");
+
+    if (*pte & PTE_COW_R) printf("COW_R ");
+    else {printf("XXXXX ");}
+
+    if (*pte & PTE_U) printf("PTE_U ");
+    else {printf("XXXXX ");}
+
+    if (*pte & PTE_X) printf("PTE_X ");
+    else {printf("XXXXX ");}
+
+    if (*pte & PTE_W) printf("PTE_W ");
+    else {printf("XXXXX ");}
+
+    if (*pte & PTE_R) printf("PTE_R ");
+    else {printf("XXXXX ");}
+
+    if (*pte & PTE_V) printf("PTE_V ");
+    else {printf("XXXXX ");}
+
+    printf("%d\n",cow_ref[COWREFINDEX(pa)]);
+  }
+  return;
+}
 
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
@@ -341,7 +535,7 @@ void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
-  
+
   pte = walk(pagetable, va, 0);
   if(pte == 0)
     panic("uvmclear");
@@ -371,6 +565,53 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     dstva = va0 + PGSIZE;
   }
   return 0;
+}
+int
+copyout_cow(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+  if(DEBUG) printf("head of copyout: len %p\n",len );
+  struct proc *p = myproc();
+  if(DEBUG) uvmshow(pagetable, p->sz);
+  for(i = PGROUNDDOWN((uint64) src); i < (uint64) src + len; i+=PGSIZE, dstva+=PGSIZE){
+    if((pte = walk(kernel_pagetable, i, 0)) == 0)
+      panic("copyout: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("copyout: page not present");
+
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    if(flags){
+      if (flags&(PTE_R|PTE_COW_R)){
+        flags |= PTE_COW_R;
+        *pte |= PTE_COW_R;
+      }
+      if (flags&(PTE_W|PTE_COW_W)){
+        flags &= ~PTE_W; //mark as not writable!
+        flags |= PTE_COW_W;
+        *pte |= PTE_COW_W;
+        *pte &= ~PTE_W;
+      }
+    }
+
+    if(DEBUG) printf("copyout: acquire cowlock\n");
+    acquire(&cow_lock);
+    //if count is 0, add 2; else add 1
+    if (cow_ref[COWREFINDEX(pa)] == 0) cow_ref[COWREFINDEX(pa)]++;
+    cow_ref[COWREFINDEX(pa)]++;
+    release(&cow_lock);
+    if(mappages(pagetable, dstva, PGSIZE, pa, flags) != 0){
+      goto err;
+    }
+  }
+  if(DEBUG) printf("return of copyout\n");
+  if(DEBUG) uvmshow(pagetable, p->sz);
+  return 0;
+
+ err:
+  panic("uvmcopy_cow: mappages fail");
 }
 
 // Copy from user to kernel.
