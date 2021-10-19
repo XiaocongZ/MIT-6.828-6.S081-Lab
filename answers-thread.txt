@@ -1,0 +1,7 @@
+When multiple threads insert into the same bucket simultaneously, with no lock to protect the invariant that table[i] points to the head of the ith bucket, some entries might be lost.
+The sequence is:
+1 thread a read table[i]
+2 thread b read table[i]
+3 thread a insert entry x to table[i]
+4 thread b insert entry y to table[i]
+we can see entry x is lost.
