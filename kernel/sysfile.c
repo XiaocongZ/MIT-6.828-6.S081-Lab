@@ -292,11 +292,13 @@ sys_open(void)
   struct inode *ip;
   int n;
 
-  if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
+  if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0){
+    printf("open: acquire args failed\n");
     return -1;
-
+  }
+  printf("open: before begin_op\n");
   begin_op();
-
+  printf("open: after begin_op\n");
   if(omode & O_CREATE){
     ip = create(path, T_FILE, 0, 0);
     if(ip == 0){
@@ -306,9 +308,12 @@ sys_open(void)
   } else {
     if((ip = namei(path)) == 0){
       end_op();
+      printf("open: namei failed, %s\n", path);
       return -1;
     }
+    printf("open: before ilock\n");
     ilock(ip);
+    printf("open: after ilock\n");
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -321,12 +326,58 @@ sys_open(void)
     end_op();
     return -1;
   }
+  //if is symbolic link
+  if(ip->type == T_SYMLINK){
+
+    if(omode & O_NOFOLLOW){
+      printf("open: T_SYMLINK O_NOFOLLOW\n");
+    }
+    else{
+      /*
+      readi(ip, 0, (uint64)path, 0, MAXPATH);
+      iunlockput(ip);
+      ip = namei(path);
+      ilock(ip);
+      */
+      printf("open: T_SYMLINK FOLLOW\n");
+      for(uint i=10; i>0; i--){
+        if(ip->type == T_FILE){
+          break;
+        }else if(ip->type == T_SYMLINK){
+          readi(ip, 0, (uint64)path, 0, MAXPATH);
+          iunlockput(ip);
+          ip = namei(path);
+          if(ip == 0){
+            end_op();
+            printf("open: namei failed\n");
+            return -1;
+          }
+          ilock(ip);
+          //
+        }else{
+          iunlockput(ip);
+          end_op();
+          printf("open: ip->type not T_SYMLINK or T_FILE\n");
+          return -1;
+        }
+
+        if(i==1){
+          iunlockput(ip);
+          end_op();
+          printf("symlink: target out of range 10\n");
+          return -1;
+        }
+      }
+    }
+
+  }
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
     if(f)
       fileclose(f);
     iunlockput(ip);
     end_op();
+    printf("open: filealloc failed\n");
     return -1;
   }
 
@@ -393,7 +444,7 @@ sys_chdir(void)
   char path[MAXPATH];
   struct inode *ip;
   struct proc *p = myproc();
-  
+
   begin_op();
   if(argstr(0, path, MAXPATH) < 0 || (ip = namei(path)) == 0){
     end_op();
@@ -483,4 +534,58 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0){
+    printf("symlink: acquire args failed\n");
+    return -1;
+  }
+
+  begin_op();
+  ip = namei(path);
+  printf("symlink: %s\n",path);
+  if(ip != 0){
+    ilock(ip);
+    ip->type = T_SYMLINK;
+    itrunc(ip);
+    if(writei(ip, 0, (uint64)target, 0, MAXPATH) != MAXPATH){
+      printf("symlink: writei failed\n");
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+    else{
+      iunlockput(ip);
+      end_op();
+      printf("symlink: success ip\n");
+      return 0;
+    }
+  }
+
+  //need to create a file
+  ip = create(path, T_SYMLINK, 0, 0);
+  if(ip == 0){
+    end_op();
+    printf("symlink: create failed\n");
+    return -1;
+  }
+
+  if(writei(ip, 0, (uint64)target, 0, MAXPATH) != MAXPATH){
+    printf("symlink: writei failed\n");
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  else{
+    iunlockput(ip);
+    end_op();
+    printf("symlink: success create ip\n");
+    return 0;
+  }
+
 }

@@ -604,6 +604,7 @@ dirlink(struct inode *dp, char *name, uint inum)
   // Check that name is not present.
   if((ip = dirlookup(dp, name, 0)) != 0){
     iput(ip);
+    printf("dirlink: already exist, %s\n", name);
     return -1;
   }
 
@@ -680,6 +681,7 @@ namex(char *path, int nameiparent, char *name)
     ilock(ip);
     if(ip->type != T_DIR){
       iunlockput(ip);
+      printf("namex: not T_DIR\n");
       return 0;
     }
     if(nameiparent && *path == '\0'){
@@ -689,6 +691,7 @@ namex(char *path, int nameiparent, char *name)
     }
     if((next = dirlookup(ip, name, 0)) == 0){
       iunlockput(ip);
+      printf("namex: dirlookup failed\n");
       return 0;
     }
     iunlockput(ip);
