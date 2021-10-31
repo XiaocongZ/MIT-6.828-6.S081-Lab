@@ -126,6 +126,7 @@ recover_from_log(void)
 void
 begin_op(void)
 {
+
   acquire(&log.lock);
   while(1){
     if(log.committing){
@@ -147,8 +148,9 @@ void
 end_op(void)
 {
   int do_commit = 0;
-
+  if(DEBUG_LOG) printf("end_op: before acquire\n");
   acquire(&log.lock);
+  if(DEBUG_LOG) printf("end_op: after acquire\n");
   log.outstanding -= 1;
   if(log.committing)
     panic("log.committing");
@@ -159,19 +161,26 @@ end_op(void)
     // begin_op() may be waiting for log space,
     // and decrementing log.outstanding has decreased
     // the amount of reserved space.
+    if(DEBUG_LOG) printf("end_op: before wakeup\n");
     wakeup(&log);
+    if(DEBUG_LOG) printf("end_op: after wakeup\n");
   }
   release(&log.lock);
 
   if(do_commit){
     // call commit w/o holding locks, since not allowed
     // to sleep with locks.
+    if(DEBUG_LOG) printf("end_op: before commit\n");
     commit();
+    if(DEBUG_LOG) printf("end_op: after commit\n");
     acquire(&log.lock);
     log.committing = 0;
+    if(DEBUG_LOG) printf("end_op: before wakeup\n");
     wakeup(&log);
+    if(DEBUG_LOG) printf("end_op: after wakeup\n");
     release(&log.lock);
   }
+  if(DEBUG_LOG) printf("end_op: before return\n");
 }
 
 // Copy modified blocks from cache to log.
@@ -193,12 +202,17 @@ write_log(void)
 static void
 commit()
 {
+  if(DEBUG_LOG) printf("commit: head\n");
   if (log.lh.n > 0) {
     write_log();     // Write modified blocks from cache to log
+    if(DEBUG_LOG) printf("commit: after write_log\n");
     write_head();    // Write header to disk -- the real commit
+    if(DEBUG_LOG) printf("commit: after write_head\n");
     install_trans(0); // Now install writes to home locations
+    if(DEBUG_LOG) printf("commit: after install_trans\n");
     log.lh.n = 0;
     write_head();    // Erase the transaction from the log
+    if(DEBUG_LOG) printf("commit: ret\n");
   }
 }
 
@@ -233,4 +247,3 @@ log_write(struct buf *b)
   }
   release(&log.lock);
 }
-

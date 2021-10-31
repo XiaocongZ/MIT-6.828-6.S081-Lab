@@ -7,6 +7,7 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "riscv.h"
+#include "proc.h"
 #include "defs.h"
 
 void freerange(void *pa_start, void *pa_end);
@@ -23,11 +24,30 @@ struct {
   struct run *freelist;
 } kmem;
 
+
+struct vmastruct vma;
+
+void
+vmaeclear(struct vmae *vmaep)
+{
+  fileclose(vmaep->file_t);
+  acquire(&vma.lock);
+  vmaep->start=0;
+  vmaep->length=0;
+  vmaep->prot=0;
+  vmaep->flags=0;
+  vmaep->file_t=0;
+  vmaep->offset=0;
+  release(&vma.lock);
+  return;
+}
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
   freerange(end, (void*)PHYSTOP);
+  initlock(&vma.lock, "vma");
 }
 
 void

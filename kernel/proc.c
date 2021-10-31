@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -21,6 +22,18 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
+struct file {
+  enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE } type;
+  int ref; // reference count
+  char readable;
+  char writable;
+  struct pipe *pipe; // FD_PIPE
+  struct inode *ip;  // FD_INODE and FD_DEVICE
+  uint off;          // FD_INODE
+  short major;       // FD_DEVICE
+};
+extern struct vmastruct vma;
+extern void   vmaeclear(struct vmae *vmaep);
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -28,7 +41,7 @@ extern char trampoline[]; // trampoline.S
 void
 proc_mapstacks(pagetable_t kpgtbl) {
   struct proc *p;
-  
+
   for(p = proc; p < &proc[NPROC]; p++) {
     char *pa = kalloc();
     if(pa == 0)
@@ -43,7 +56,7 @@ void
 procinit(void)
 {
   struct proc *p;
-  
+
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
@@ -83,7 +96,7 @@ myproc(void) {
 int
 allocpid() {
   int pid;
-  
+
   acquire(&pid_lock);
   pid = nextpid;
   nextpid = nextpid + 1;
@@ -222,7 +235,7 @@ userinit(void)
 
   p = allocproc();
   initproc = p;
-  
+
   // allocate one user page and copy init's instructions
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
@@ -282,6 +295,54 @@ fork(void)
   }
   np->sz = p->sz;
 
+  //copy vmaep and make vma slots
+  acquire(&vma.lock);
+  struct vmae *vmae_p=0;
+  struct vmae *vmae_glob=0;
+  struct vmae **vmae_np=0;
+  for(int i = 0;i < 16; i++){
+    vmae_p = vmae_glob = 0;
+    vmae_np = 0;
+    if(p->vmaep[i] && p->vmaep[i]->length){
+      vmae_p = p->vmaep[i];
+    }
+    else{
+      //miss, look for next vmaep[i]
+      continue;
+    }
+    //get new slot
+    for(int j = 0; j < 20; j++){
+      if(vma.vmae[j].length==0){
+        vmae_glob = vma.vmae + j;
+        vmae_glob->start = vmae_p->start;
+        vmae_glob->length = vmae_p->length;
+        vmae_glob->prot = vmae_p->prot;
+        vmae_glob->flags = vmae_p->flags;
+        vmae_glob->file_t = vmae_p->file_t;
+        filedup(vmae_glob->file_t);
+        vmae_glob->offset = vmae_p->offset;
+        break;
+      }
+    }
+    if(vmae_glob==0){
+      if(DEBUG) printf("fork: vmaep_glob==0\n");
+      return -1;
+    }
+    //copy
+    for(int k = 0; k < 16; k++){
+      if(np->vmaep[k] ==0){
+        if(DEBUG) printf("fork: copy to np->vmaep[%d] %p %p\n", k, vmae_glob->start, vmae_glob->length);
+        vmae_np = np->vmaep + k;
+        *vmae_np = vmae_glob;
+        break;
+      }
+    }
+    if(vmae_np==0){
+      if(DEBUG) printf("fork: vmaep_np==0\n");
+      return -1;
+    }
+  }
+  release(&vma.lock);
   np->parent = p;
 
   // copy saved user registers.
@@ -343,7 +404,52 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
-
+  //mmap clean
+  struct vmae *vmaep_proc=0;
+  uint64 start;
+  int length, flags, offset;
+  struct file *file_t;
+  /*
+  for(int i=0; i < 16; i++){
+    if(p->vmaep[i]) printf("exit: p->vmaep[%d] %p %p\n", i, p->vmaep[i]->start, p->vmaep[i]->length);
+  }
+  */
+  for(int i=0; i < 16; i++){
+    if(p->vmaep[i]==0){
+      continue;
+    }
+    vmaep_proc = p->vmaep[i];
+    start = (uint64) vmaep_proc->start;
+    length = vmaep_proc->length;
+    flags = vmaep_proc->flags;
+    offset = vmaep_proc->offset;
+    file_t = vmaep_proc->file_t;
+    //possibly write back to file
+    if(flags&MAP_SHARED){
+      if(DEBUG) printf("exit: write back to file\n");
+      pte_t *pte;
+      for(uint64 pg = start; pg < start+length; pg=pg+PGSIZE){
+        pte = walk(p->pagetable, pg, 0);
+        file_t->off = offset + pg - start;
+        if(*pte & PTE_D) filewrite(file_t, pg, PGSIZE);
+      }
+    }
+    vmaeclear(vmaep_proc);
+    p->vmaep[i] = 0;
+  }
+  //remap not valid pte
+  uint64 pa;
+  pte_t *pte;
+  for(uint64 pg = 0; pg < p->sz; pg+=PGSIZE){
+    pte = walk(p->pagetable, pg, 0);
+    if(pte==0 || (*pte&PTE_V)==0){
+      if(DEBUG) printf("exit: remap %p\n", pg);
+      if((pa=(uint64)kalloc())==0) panic("mmap: kalloc failed");
+      memset((void*)pa, 6, PGSIZE);
+      mappages(p->pagetable, pg, PGSIZE,  pa, PTE_U|PTE_R|PTE_W);
+    }
+  }
+  if(DEBUG) printf("exit: remap done\n");
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
@@ -376,7 +482,7 @@ exit(int status)
   acquire(&p->lock);
   struct proc *original_parent = p->parent;
   release(&p->lock);
-  
+
   // we need the parent's lock in order to wake it up from wait().
   // the parent-then-child rule says we have to lock it first.
   acquire(&original_parent->lock);
@@ -447,7 +553,7 @@ wait(uint64 addr)
       release(&p->lock);
       return -1;
     }
-    
+
     // Wait for a child to exit.
     sleep(p, &p->lock);  //DOC: wait-sleep
   }
@@ -465,12 +571,12 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  
+
   c->proc = 0;
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
-    
+
     int nproc = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
@@ -563,7 +669,7 @@ void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
-  
+
   // Must acquire p->lock in order to
   // change p->state and then call sched.
   // Once we hold p->lock, we can be

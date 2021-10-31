@@ -62,8 +62,11 @@ fileclose(struct file *f)
   struct file ff;
 
   acquire(&ftable.lock);
-  if(f->ref < 1)
+  if(f->ref < 1){
+    if(DEBUG) printf("fileclose: %d\n", f->ref);
     panic("fileclose");
+  }
+
   if(--f->ref > 0){
     release(&ftable.lock);
     return;
@@ -89,7 +92,7 @@ filestat(struct file *f, uint64 addr)
 {
   struct proc *p = myproc();
   struct stat st;
-  
+
   if(f->type == FD_INODE || f->type == FD_DEVICE){
     ilock(f->ip);
     stati(f->ip, &st);
@@ -179,4 +182,3 @@ filewrite(struct file *f, uint64 addr, int n)
 
   return ret;
 }
-
